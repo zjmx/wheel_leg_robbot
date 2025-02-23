@@ -1,0 +1,111 @@
+#include "balance_chair_task.h"
+
+extern RC_ctrl_t rc_ctrl;//遥控器数据指针
+extern INS_t INS;//mcu数据结构体
+extern BM_motor_measure_t BM_motor_left[3];//BM电机数据返回结构体
+extern BM_motor_measure_t BM_motor_right[3];//BM电机数据返回结构体
+
+//车体数据结构体
+Chassis_t Chassis_right;
+
+//VMC结构体
+extern vmc_leg_t vmc_right;
+extern vmc_leg_t vmc_left;
+
+pid_type_def BM_motor_wheel_pid[2];
+float BM_wheel_pid[2][3]={{100,10,0},{100,10,0}};
+
+//LQR增益矩阵K初始化  -1.0000,-18.2248,-712.2668,-7.4237   
+float K_gain[4]={-0.3162,-316.3337,-459.4729,-57.8134};//x,d_x,pitch,d_pitch  -1.0000,-2.5214,-12.6994,-2.1149
+//状态向量初始化
+float x_gain[4]={0.0f,0.0f,0.0f,0.0f};//位移x，速率dx，俯仰角θ，俯仰角速度dθ
+
+//系统输出值
+double speed_motor_out[2];
+
+uint8_t ctrl_mode[8];
+
+//系统采样时间
+
+//底盘参数初始化
+void balance_chair_init(void)
+{
+	//PID初始化
+	PID_init(&BM_motor_wheel_pid[0],BM_wheel_pid[0],5000,5000);
+	PID_init(&BM_motor_wheel_pid[1],BM_wheel_pid[1],5000,5000);
+	
+	//VMC初始化
+	VMC_init(&vmc_right);
+}
+
+//底盘运动函数
+void balance_chair_task(void)
+{
+	while(INS.ins_flag==0)
+	{//等待accel收敛
+		osDelay(1);
+	}
+	//初始化
+	balance_chair_init();
+	for(int i=0;i<8;i++)
+	{
+		ctrl_mode[i]=BM_enable_mode_joint;
+	}
+	BM_ctrl_mode_joint_set(&hcan1,ctrl_mode);
+	BM_ctrl_mode_joint_set(&hcan2,ctrl_mode);
+	while(1)
+	{
+		//获取系统时间
+		
+		//更新系统状态向量
+		updatestate(x_gain,((BM_motor_left[0].speed_rpm-BM_motor_right[0].speed_rpm)*PI*0.09/60.0f),INS.Pitch,INS.Gyro[0]);
+		chassisR_feedback_update(&Chassis_right,&BM_motor_right[1],&BM_motor_right[2],&vmc_right,&INS);
+		
+		//VMC
+		VMC_calc_1_right(&vmc_right,&INS,SYS_delay*3.0f/1000.0f);//计算L0长度
+		
+		//计算LQR控制器输出
+		speed_motor_out[0]=-LQR_Controller(x_gain)-rc_ctrl.rc.ch[3]/10;
+		speed_motor_out[1]=LQR_Controller(x_gain)+rc_ctrl.rc.ch[3]/10;	
+		
+		//计算电机PID输出
+		PID_calc(&BM_motor_wheel_pid[0],BM_motor_left[0].speed_rpm,speed_motor_out[1]);
+		PID_calc(&BM_motor_wheel_pid[1],BM_motor_right[0].speed_rpm,speed_motor_out[0]);
+		
+//传入电机速度值
+//		BM_motor_ctrl(&hcan1,BM_ID_range1,BM_motor_wheel_pid[0].out,0,0,0);//right
+//		BM_motor_ctrl(&hcan2,BM_ID_range2,BM_motor_wheel_pid[1].out,0,0,0);//left
+		BM_motor_ctrl(&hcan1,BM_ID_range1,0,rc_ctrl.rc.ch[3]/2,-rc_ctrl.rc.ch[3]/2,0);
+		BM_motor_ctrl(&hcan2,BM_ID_range2,0,-rc_ctrl.rc.ch[3]/2,rc_ctrl.rc.ch[3]/2,0);
+//		BM_motor_ctrl(&hcan1,BM_ID_range1,0,0,0,0);
+//		BM_motor_ctrl(&hcan2,BM_ID_range1,0,0,0,0);
+		osDelay(SYS_delay);
+	}
+}
+
+//LQR控制器
+float LQR_Controller(float x[4])
+{
+	float output;
+	output=(K_gain[0]*x[0])+(K_gain[1]*x[1])+(K_gain[2]*x[2])+(K_gain[3]*x[3]);
+	return -output;
+}
+
+//返回数据更新
+void chassisR_feedback_update(Chassis_t *Chassis_R,BM_motor_measure_t *BM_motor_R_1,BM_motor_measure_t *BM_motor_R_4,vmc_leg_t *vmc,INS_t *ins)
+{
+  vmc->phi1=pi/2.0f+BM_motor_R_1->ecd_angle;
+	vmc->phi4=pi/2.0f+BM_motor_R_4->ecd_angle;
+		
+	Chassis_R->Pitch=ins->Pitch;
+	Chassis_R->d_Pitch=ins->Gyro[0];
+}
+
+//更新系统状态向量
+void updatestate(float x[4],float dx,float angle,float d_angle)
+{
+	x[0]+=x[1]*ins_dt;//位移
+	x[1]=dx;//速率
+	x[2]=angle;//角度
+	x[3]=d_angle;//角速度
+}
